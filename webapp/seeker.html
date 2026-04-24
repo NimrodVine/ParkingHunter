@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>ParkingHunter — חיפוש חנייה</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root {
+            --tg-bg: var(--tg-theme-bg-color, #1a1a2e);
+            --tg-text: var(--tg-theme-text-color, #ffffff);
+            --tg-hint: var(--tg-theme-hint-color, #999999);
+            --tg-button: var(--tg-theme-button-color, #3b82f6);
+            --tg-button-text: var(--tg-theme-button-text-color, #ffffff);
+            --tg-secondary-bg: var(--tg-theme-secondary-bg-color, #16213e);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--tg-bg);
+            color: var(--tg-text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .screen {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+            max-width: 360px;
+            gap: 20px;
+            animation: fadeIn 0.3s ease;
+        }
+        .screen.active { display: flex; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .icon-large { font-size: 72px; }
+        h1 { font-size: 24px; font-weight: 700; text-align: center; }
+        .subtitle {
+            color: var(--tg-hint);
+            font-size: 15px;
+            text-align: center;
+            line-height: 1.6;
+        }
+
+        /* Pulse animation for searching */
+        .pulse {
+            animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.7; }
+        }
+
+        /* Spinner */
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid var(--tg-secondary-bg);
+            border-top-color: var(--tg-button);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Garage card */
+        .garage-card {
+            width: 100%;
+            background: var(--tg-secondary-bg);
+            border-radius: 14px;
+            padding: 18px;
+            text-align: right;
+        }
+        .garage-header {
+            font-size: 13px;
+            color: var(--tg-hint);
+            margin-bottom: 10px;
+        }
+        .garage-name {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .garage-details {
+            display: flex;
+            gap: 16px;
+            font-size: 14px;
+            color: var(--tg-hint);
+        }
+        .garage-details span { display: flex; align-items: center; gap: 4px; }
+
+        /* Status dots */
+        .status-dots {
+            display: flex;
+            gap: 6px;
+            justify-content: center;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--tg-button);
+            animation: dotPulse 1.4s ease-in-out infinite;
+        }
+        .status-dot:nth-child(2) { animation-delay: 0.2s; }
+        .status-dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes dotPulse {
+            0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+            40% { opacity: 1; transform: scale(1.2); }
+        }
+
+        .btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 17px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.15s;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn-primary { background: var(--tg-button); color: var(--tg-button-text); }
+        .btn-secondary { background: var(--tg-secondary-bg); color: var(--tg-text); }
+
+        /* Success checkmark animation */
+        .checkmark {
+            font-size: 64px;
+            animation: popIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        @keyframes popIn {
+            0% { transform: scale(0); opacity: 0; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        .error-card {
+            background: rgba(239,68,68,0.12);
+            border: 1px solid rgba(239,68,68,0.3);
+            border-radius: 14px;
+            padding: 20px;
+            text-align: center;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+
+<!-- ==================== SCREEN 1: GETTING LOCATION ==================== -->
+<div id="screen-locating" class="screen active">
+    <div class="spinner"></div>
+    <h1>מאתר את המיקום שלך...</h1>
+    <p class="subtitle">רגע, זה מהיר</p>
+</div>
+
+<!-- ==================== SCREEN 2: SEARCHING (success) ==================== -->
+<div id="screen-searching" class="screen">
+    <div class="icon-large pulse">🔍</div>
+    <h1>אנחנו על זה!</h1>
+    <p class="subtitle">
+        אם חנייה תתפנה באזור שלך —<br>
+        תקבל הודעה ישירות לצ'אט
+    </p>
+    <div class="status-dots">
+        <div class="status-dot"></div>
+        <div class="status-dot"></div>
+        <div class="status-dot"></div>
+    </div>
+    <div id="garage-section"></div>
+    <p class="subtitle" style="font-size:12px; margin-top: 8px;">
+        אפשר לסגור — ההתראות ימשיכו להגיע בצ'אט
+    </p>
+    <button class="btn btn-primary" onclick="closeApp()">👍 הבנתי, חזרה לצ'אט</button>
+</div>
+
+<!-- ==================== SCREEN 3: ERROR ==================== -->
+<div id="screen-error" class="screen">
+    <div class="icon-large">😕</div>
+    <h1>משהו לא עבד</h1>
+    <div id="error-message" class="error-card">
+        <p class="subtitle">לא הצלחנו לאתר מיקום</p>
+    </div>
+    <button class="btn btn-primary" onclick="retryLocation()">🔄 נסה שוב</button>
+    <button class="btn btn-secondary" onclick="closeApp()">חזרה לצ'אט</button>
+</div>
+
+<script>
+    // =============================================
+    // Telegram WebApp init
+    // =============================================
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+
+    // =============================================
+    // Screen navigation
+    // =============================================
+    function showScreen(id) {
+        document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+    }
+
+    // =============================================
+    // Auto-start: get location immediately
+    // =============================================
+    window.addEventListener('load', () => {
+        getLocationAndSearch();
+    });
+
+    function getLocationAndSearch() {
+        showScreen('screen-locating');
+
+        if (!navigator.geolocation) {
+            showError('GPS לא זמין במכשיר');
+            return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+            async (pos) => {
+                const lat = pos.coords.latitude;
+                const lng = pos.coords.longitude;
+                await startSearch(lat, lng);
+            },
+            (err) => {
+                const messages = {
+                    1: 'צריך אישור לגשת למיקום.\nלחצו "אפשר" ונסו שוב.',
+                    2: 'לא הצלחנו לאתר מיקום.\nודאו ש-GPS פעיל.',
+                    3: 'זמן המתנה ארוך מדי.\nנסו שוב.'
+                };
+                showError(messages[err.code] || 'שגיאה באיתור מיקום');
+            },
+            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+    }
+
+    // =============================================
+    // Start search — call API
+    // =============================================
+    async function startSearch(lat, lng) {
+        try {
+            const initData = tg.initData;
+
+            const resp = await fetch('/api/start-search', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Telegram-Init-Data': initData,
+                },
+                body: JSON.stringify({ latitude: lat, longitude: lng }),
+            });
+
+            const result = await resp.json();
+
+            if (!result.success) {
+                showError(result.reason || 'שגיאה ביצירת חיפוש');
+                return;
+            }
+
+            // Show searching screen
+            showScreen('screen-searching');
+
+            // Show garage suggestion if available
+            if (result.garage) {
+                const g = result.garage;
+                document.getElementById('garage-section').innerHTML = `
+                    <div class="garage-card">
+                        <div class="garage-header">💡 בינתיים, חניון קרוב:</div>
+                        <div class="garage-name">📍 ${g.name}</div>
+                        <div class="garage-details">
+                            <span>💰 ${g.price_per_hour}₪/שעה</span>
+                            <span>📏 ${Math.round(g.distance_meters)} מטר</span>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Also send data back to bot chat
+            tg.sendData(JSON.stringify({
+                action: 'search_started',
+                latitude: lat,
+                longitude: lng,
+            }));
+
+        } catch (err) {
+            showError('שגיאת רשת. נסו שוב.');
+        }
+    }
+
+    // =============================================
+    // Error handling
+    // =============================================
+    function showError(message) {
+        document.querySelector('#error-message .subtitle').textContent = message;
+        showScreen('screen-error');
+    }
+
+    function retryLocation() {
+        getLocationAndSearch();
+    }
+
+    function closeApp() {
+        tg.close();
+    }
+</script>
+</body>
+</html>

@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>ParkingHunter — צד חנייה</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root {
+            --tg-bg: var(--tg-theme-bg-color, #1a1a2e);
+            --tg-text: var(--tg-theme-text-color, #ffffff);
+            --tg-hint: var(--tg-theme-hint-color, #999999);
+            --tg-button: var(--tg-theme-button-color, #3b82f6);
+            --tg-button-text: var(--tg-theme-button-text-color, #ffffff);
+            --tg-secondary-bg: var(--tg-theme-secondary-bg-color, #16213e);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--tg-bg);
+            color: var(--tg-text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 12px;
+            overflow-x: hidden;
+        }
+
+        .screen {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+            max-width: 400px;
+            gap: 14px;
+            animation: fadeIn 0.3s ease;
+        }
+        .screen.active { display: flex; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 { font-size: 22px; font-weight: 700; text-align: center; }
+        .subtitle {
+            color: var(--tg-hint);
+            font-size: 14px;
+            text-align: center;
+            line-height: 1.5;
+        }
+        .icon-large { font-size: 64px; margin: 10px 0; }
+
+        /* GPS status badge (floats on top of camera) */
+        .gps-badge {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            z-index: 10;
+            backdrop-filter: blur(8px);
+        }
+        .gps-badge.loading {
+            background: rgba(59,130,246,0.7);
+            color: #fff;
+        }
+        .gps-badge.ready {
+            background: rgba(34,197,94,0.7);
+            color: #fff;
+        }
+        .gps-badge.error {
+            background: rgba(239,68,68,0.7);
+            color: #fff;
+        }
+
+        /* Buttons */
+        .btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 17px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.15s, opacity 0.15s;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background: var(--tg-button); color: var(--tg-button-text); }
+        .btn-secondary { background: var(--tg-secondary-bg); color: var(--tg-text); }
+
+        /* Camera */
+        .camera-container {
+            width: 100%;
+            aspect-ratio: 4/3;
+            border-radius: 16px;
+            overflow: hidden;
+            background: #000;
+            position: relative;
+        }
+        .camera-container video,
+        .camera-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .camera-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 12px;
+            background: linear-gradient(transparent, rgba(0,0,0,0.7));
+            color: #fff;
+            font-size: 13px;
+            text-align: center;
+        }
+
+        /* Shutter */
+        .shutter-btn {
+            width: 72px;
+            height: 72px;
+            border-radius: 50%;
+            border: 4px solid #fff;
+            background: rgba(255,255,255,0.2);
+            cursor: pointer;
+            transition: transform 0.15s;
+            position: relative;
+        }
+        .shutter-btn:active { transform: scale(0.9); }
+        .shutter-btn::after {
+            content: '';
+            position: absolute;
+            inset: 6px;
+            border-radius: 50%;
+            background: #fff;
+        }
+
+        /* Spinner */
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid var(--tg-secondary-bg);
+            border-top-color: var(--tg-button);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Result */
+        .result-card {
+            width: 100%;
+            border-radius: 16px;
+            padding: 24px;
+            text-align: center;
+        }
+        .result-card.success { background: rgba(34,197,94,0.15); }
+        .result-card.error { background: rgba(239,68,68,0.15); }
+        .result-icon { font-size: 56px; margin-bottom: 12px; }
+        .result-title { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+        .result-sub { color: var(--tg-hint); font-size: 14px; }
+
+        canvas { display: none; }
+    </style>
+</head>
+<body>
+
+<!-- ==================== SCREEN 1: CAMERA (opens immediately!) ==================== -->
+<div id="screen-camera" class="screen active">
+    <h1>📸 צלם את המדרכה</h1>
+    <p class="subtitle">צלם את אבני השפה הכחול-לבן<br>ודא שנראות לפחות 4 אבנים ברצף</p>
+    <div class="camera-container">
+        <div class="gps-badge loading" id="gps-badge">📍 מאתר מיקום...</div>
+        <video id="camera-feed" autoplay playsinline></video>
+        <img id="photo-preview" style="display:none;" />
+        <div class="camera-overlay" id="camera-overlay">כוון את המצלמה לאבני השפה</div>
+    </div>
+    <div id="camera-controls" style="display:flex; gap:16px; align-items:center;">
+        <button class="shutter-btn" id="btn-capture" onclick="capturePhoto()"></button>
+    </div>
+    <div id="photo-actions" style="display:none; width:100%; gap:10px; flex-direction:column;">
+        <button class="btn btn-primary" id="btn-submit" onclick="submitSpot()">✅ שלח לבדיקה</button>
+        <button class="btn btn-secondary" onclick="retakePhoto()">🔄 צלם מחדש</button>
+    </div>
+    <canvas id="canvas"></canvas>
+</div>
+
+<!-- ==================== SCREEN 2: VALIDATING ==================== -->
+<div id="screen-validating" class="screen">
+    <div class="icon-large">🔍</div>
+    <h1>בודק את התמונה...</h1>
+    <p class="subtitle">מוודא שהחנייה תקינה</p>
+    <div class="spinner"></div>
+</div>
+
+<!-- ==================== SCREEN 3: RESULT ==================== -->
+<div id="screen-result" class="screen">
+    <div id="result-card" class="result-card">
+        <div class="result-icon" id="result-icon"></div>
+        <div class="result-title" id="result-title"></div>
+        <div class="result-sub" id="result-sub"></div>
+    </div>
+    <button id="btn-retry" class="btn btn-secondary" style="display:none;" onclick="retryFlow()">🔄 נסה שוב</button>
+    <button id="btn-close" class="btn btn-primary" style="display:none;" onclick="closeApp()">👍 סגור</button>
+</div>
+
+<script>
+    // =============================================
+    // Telegram WebApp init
+    // =============================================
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+
+    // State
+    let userLat = null;
+    let userLng = null;
+    let gpsReady = false;
+    let gpsError = false;
+    let photoBlob = null;
+    let cameraStream = null;
+
+    // =============================================
+    // ON LOAD: Start camera + GPS simultaneously
+    // =============================================
+    window.addEventListener('load', () => {
+        startCamera();
+        getLocationSilently();
+    });
+
+    function showScreen(id) {
+        document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+    }
+
+    // =============================================
+    // GPS — runs silently in background
+    // =============================================
+    function getLocationSilently() {
+        const badge = document.getElementById('gps-badge');
+
+        if (!navigator.geolocation) {
+            badge.className = 'gps-badge error';
+            badge.textContent = '❌ GPS לא זמין';
+            gpsError = true;
+            return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+            (pos) => {
+                userLat = pos.coords.latitude;
+                userLng = pos.coords.longitude;
+                gpsReady = true;
+
+                // Update badge
+                badge.className = 'gps-badge ready';
+                badge.textContent = '✅ מיקום נקלט';
+
+                // Fade out after 2 seconds
+                setTimeout(() => { badge.style.opacity = '0'; }, 2000);
+
+                // Enable submit button if photo is already taken
+                updateSubmitButton();
+            },
+            (err) => {
+                gpsError = true;
+                badge.className = 'gps-badge error';
+                const messages = {
+                    1: '❌ צריך אישור מיקום',
+                    2: '❌ GPS לא זמין',
+                    3: '❌ מיקום איטי מדי'
+                };
+                badge.textContent = messages[err.code] || '❌ שגיאת מיקום';
+
+                // Retry once after 2 seconds
+                setTimeout(() => {
+                    if (!gpsReady) {
+                        badge.className = 'gps-badge loading';
+                        badge.textContent = '📍 מנסה שוב...';
+                        badge.style.opacity = '1';
+                        gpsError = false;
+                        navigator.geolocation.getCurrentPosition(
+                            (pos) => {
+                                userLat = pos.coords.latitude;
+                                userLng = pos.coords.longitude;
+                                gpsReady = true;
+                                badge.className = 'gps-badge ready';
+                                badge.textContent = '✅ מיקום נקלט';
+                                setTimeout(() => { badge.style.opacity = '0'; }, 2000);
+                                updateSubmitButton();
+                            },
+                            () => {
+                                gpsError = true;
+                                badge.className = 'gps-badge error';
+                                badge.textContent = '❌ אפשרו GPS ונסו שוב';
+                            },
+                            { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 }
+                        );
+                    }
+                }, 2000);
+            },
+            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+    }
+
+    // =============================================
+    // CAMERA — opens immediately
+    // =============================================
+    async function startCamera() {
+        try {
+            cameraStream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } }
+            });
+            const video = document.getElementById('camera-feed');
+            video.srcObject = cameraStream;
+        } catch (err) {
+            // Fallback: let user pick from gallery
+            offerFileUpload();
+        }
+    }
+
+    function stopCamera() {
+        if (cameraStream) {
+            cameraStream.getTracks().forEach(t => t.stop());
+            cameraStream = null;
+        }
+    }
+
+    function capturePhoto() {
+        const video = document.getElementById('camera-feed');
+        const canvas = document.getElementById('canvas');
+        const preview = document.getElementById('photo-preview');
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+
+        canvas.toBlob((blob) => {
+            photoBlob = blob;
+            preview.src = URL.createObjectURL(blob);
+            preview.style.display = 'block';
+            video.style.display = 'none';
+            document.getElementById('camera-controls').style.display = 'none';
+            document.getElementById('photo-actions').style.display = 'flex';
+            document.getElementById('camera-overlay').textContent = 'בדוק שהתמונה ברורה';
+            updateSubmitButton();
+        }, 'image/jpeg', 0.85);
+    }
+
+    function retakePhoto() {
+        const video = document.getElementById('camera-feed');
+        const preview = document.getElementById('photo-preview');
+        preview.style.display = 'none';
+        video.style.display = 'block';
+        document.getElementById('camera-controls').style.display = 'flex';
+        document.getElementById('photo-actions').style.display = 'none';
+        document.getElementById('camera-overlay').textContent = 'כוון את המצלמה לאבני השפה';
+        photoBlob = null;
+    }
+
+    function offerFileUpload() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.capture = 'environment';
+        input.onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            photoBlob = file;
+            const preview = document.getElementById('photo-preview');
+            preview.src = URL.createObjectURL(file);
+            preview.style.display = 'block';
+            document.getElementById('camera-feed').style.display = 'none';
+            document.getElementById('camera-controls').style.display = 'none';
+            document.getElementById('photo-actions').style.display = 'flex';
+            updateSubmitButton();
+        };
+        input.click();
+    }
+
+    // =============================================
+    // Submit button state
+    // =============================================
+    function updateSubmitButton() {
+        const btn = document.getElementById('btn-submit');
+        if (!btn) return;
+
+        if (photoBlob && gpsReady) {
+            btn.disabled = false;
+            btn.textContent = '✅ שלח לבדיקה';
+        } else if (photoBlob && !gpsReady && !gpsError) {
+            btn.disabled = true;
+            btn.textContent = '⏳ ממתין למיקום...';
+        } else if (photoBlob && gpsError) {
+            btn.disabled = true;
+            btn.textContent = '❌ אין מיקום — אפשרו GPS';
+        }
+    }
+
+    // =============================================
+    // SUBMIT
+    // =============================================
+    async function submitSpot() {
+        if (!photoBlob || !userLat || !userLng) {
+            alert('חסר מיקום. ודאו ש-GPS פעיל ונסו שוב.');
+            return;
+        }
+
+        stopCamera();
+        showScreen('screen-validating');
+
+        try {
+            const formData = new FormData();
+            formData.append('photo', photoBlob, 'spot.jpg');
+            formData.append('latitude', userLat.toString());
+            formData.append('longitude', userLng.toString());
+
+            const resp = await fetch('/api/submit-spot', {
+                method: 'POST',
+                headers: { 'X-Telegram-Init-Data': tg.initData },
+                body: formData,
+            });
+
+            const result = await resp.json();
+
+            if (result.success) {
+                showResult(true, result.points);
+            } else {
+                showResult(false, 0, result.reason || 'התמונה לא תקינה');
+            }
+        } catch (err) {
+            showResult(false, 0, 'שגיאת רשת. נסו שוב.');
+        }
+    }
+
+    // =============================================
+    // RESULT
+    // =============================================
+    function showResult(success, points, reason) {
+        showScreen('screen-result');
+        const card = document.getElementById('result-card');
+        const icon = document.getElementById('result-icon');
+        const title = document.getElementById('result-title');
+        const sub = document.getElementById('result-sub');
+
+        if (success) {
+            card.className = 'result-card success';
+            icon.textContent = '🎉';
+            title.textContent = 'החנייה נשמרה!';
+            sub.textContent = `+1 נקודה (סה״כ: ${points}) — תודה שעוזרים לקהילה!`;
+            document.getElementById('btn-close').style.display = 'block';
+            document.getElementById('btn-retry').style.display = 'none';
+            tg.sendData(JSON.stringify({ action: 'spot_saved', points }));
+        } else {
+            card.className = 'result-card error';
+            icon.textContent = '❌';
+            title.textContent = 'התמונה לא אושרה';
+            sub.textContent = reason;
+            document.getElementById('btn-retry').style.display = 'block';
+            document.getElementById('btn-close').style.display = 'none';
+        }
+    }
+
+    function retryFlow() {
+        photoBlob = null;
+        showScreen('screen-camera');
+        startCamera();
+    }
+
+    function closeApp() {
+        tg.close();
+    }
+</script>
+</body>
+</html>
