@@ -653,4 +653,348 @@ async def matching_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         seeker_tid: int = seeker["seeker_telegram_id"]
         distance_m: float = seeker["distance_meters"]
 
-        # Send notification with photo i
+        # Send notification with photo if available
+        photo_url = spot.get("photo_url", "")
+        try:
+            if photo_url:
+                await context.bot.send_photo(
+                    chat_id=seeker_tid,
+                    photo=photo_url,
+                    caption=MSG_SPOT_FOUND.format(distance=int(distance_m)),
+                    reply_markup=spot_keyboard(spot_id, lat, lng),
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=seeker_tid,
+                    text=MSG_SPOT_FOUND.format(distance=int(distance_m)),
+                    reply_markup=spot_keyboard(spot_id, lat, lng),
+                )
+        except Exception:
+            logger.warning("Could not notify seeker %s", seeker_tid)
+            continue
+
+        # Update spot tracking (spot stays active until seeker clicks navigate)
+        notified.append(seeker_tid)
+        try:
+            await update_spot(spot_id, {
+                "notified_seekers": notified,
+                "current_notify_index": idx + 1,
+                "last_notified_at": now.isoformat(),
+            })
+        except Exception:
+            logger.warning("Failed to update spot %s notified list", spot_id)
+
+
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: remove expired spots and sessions."""
+    await cleanup_expired()
+    logger.info("Cleanup job ran")
+
+
+# ---------------------------------------------------------------------------
+# Telegram WebApp init-data verification
+# ---------------------------------------------------------------------------
+def verify_telegram_init_data(init_data: str) -> Optional[dict]:
+    """
+    Verify that the init data was signed by Telegram.
+    Returns the parsed user dict or None if invalid.
+    See: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+    """
+    try:
+        parsed = parse_qs(init_data)
+        check_hash = parsed.get("hash", [None])[0]
+        if not check_hash:
+            return None
+
+        # Build the data-check-string (all params except hash, sorted)
+        data_pairs = []
+        for key, values in parsed.items():
+            if key == "hash":
+                continue
+            data_pairs.append(f"{key}={values[0]}")
+        data_pairs.sort()
+        data_check_string = "\n".join(data_pairs)
+
+        # HMAC-SHA256
+        secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+        if computed_hash != check_hash:
+            logger.warning("Telegram init data hash mismatch")
+            return None
+
+        # Extract user info
+        user_json = parsed.get("user", [None])[0]
+        if user_json:
+            return json.loads(user_json)
+        return None
+    except Exception:
+        logger.exception("Failed to verify Telegram init data")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Web server (serves Mini App + API)
+# ---------------------------------------------------------------------------
+WEBAPP_DIR = Path(__file__).parent / "webapp"
+
+
+async def handle_hunter_page(request: web.Request) -> web.Response:
+    """Serve the hunter Mini App HTML."""
+    html_path = WEBAPP_DIR / "hunter.html"
+    if not html_path.exists():
+        return web.Response(text="Mini App not found", status=404)
+    return web.FileResponse(html_path)
+
+
+async def handle_submit_spot(request: web.Request) -> web.Response:
+    """
+    API endpoint: receive photo + location from the Mini App.
+    Validates the photo with Claude (base64), saves to Supabase, awards points.
+    """
+    # Verify Telegram auth
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    user_info = verify_telegram_init_data(init_data)
+    if not user_info:
+        return web.json_response({"success": False, "reason": "🔐 לא הצלחנו לזהות אותך. נסה שוב מהתפריט."}, status=401)
+
+    telegram_id = user_info["id"]
+    username = user_info.get("username", "")
+    first_name = user_info.get("first_name", "")
+
+    # Upsert user (required — spots have foreign key to users)
+    try:
+        await upsert_user(telegram_id, username, first_name)
+    except Exception:
+        logger.exception("upsert_user failed for %s", telegram_id)
+        return web.json_response({"success": False, "reason": "😅 לא הצלחנו ליצור משתמש. נסה שוב."}, status=500)
+
+    # Parse multipart form
+    try:
+        reader = await request.multipart()
+        photo_data = None
+        lat = None
+        lng = None
+
+        async for part in reader:
+            if part.name == "photo":
+                photo_data = await part.read()
+            elif part.name == "latitude":
+                lat = float((await part.read()).decode())
+            elif part.name == "longitude":
+                lng = float((await part.read()).decode())
+
+        if not photo_data or lat is None or lng is None:
+            return web.json_response({"success": False, "reason": "📸 חסרים נתונים. נסה לצלם שוב."}, status=400)
+    except Exception:
+        logger.exception("Failed to parse Mini App submission")
+        return web.json_response({"success": False, "reason": "📸 משהו השתבש עם התמונה. נסה שוב."}, status=400)
+
+    # Validate with Claude Vision (send base64 directly — no Telegram upload needed)
+    is_valid, reason = await validate_photo_bytes(photo_data)
+    if not is_valid:
+        # Send rejection to chat too
+        try:
+            await http_client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": telegram_id, "text": f"❌ {reason}"},
+            )
+        except Exception:
+            pass
+        return web.json_response({"success": False, "reason": reason})
+
+    # Photo approved! Now upload to Telegram to get a URL for storage
+    photo_url = ""
+    try:
+        upload_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        upload_resp = await http_client.post(
+            upload_url,
+            files={"photo": ("spot.jpg", photo_data, "image/jpeg")},
+            data={"chat_id": str(telegram_id), "caption": "✅ חנייה אושרה!"},
+        )
+        upload_result = upload_resp.json()
+        if upload_result.get("ok"):
+            photos = upload_result["result"]["photo"]
+            file_id = photos[-1]["file_id"]
+            file_resp = await http_client.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                params={"file_id": file_id},
+            )
+            file_result = file_resp.json()
+            file_path = file_result["result"]["file_path"]
+            photo_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    except Exception:
+        logger.warning("Failed to upload approved photo to Telegram (saving without URL)")
+
+    # Save spot + award points
+    try:
+        await save_spot(telegram_id, lat, lng, photo_url)
+        new_points = await increment_hunter_points(telegram_id)
+    except Exception:
+        logger.exception("Failed to save spot from Mini App")
+        return web.json_response({"success": False, "reason": "😅 החנייה אושרה אבל לא הצלחנו לשמור. נסה שוב?"}, status=500)
+
+    # Send success message in chat
+    try:
+        await http_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": telegram_id,
+                "text": MSG_HUNTER_SPOT_SAVED.format(points=new_points),
+            },
+        )
+    except Exception:
+        pass
+
+    return web.json_response({"success": True, "points": new_points})
+
+
+async def handle_seeker_page(request: web.Request) -> web.Response:
+    """Serve the seeker Mini App HTML."""
+    html_path = WEBAPP_DIR / "seeker.html"
+    if not html_path.exists():
+        return web.Response(text="Mini App not found", status=404)
+    return web.FileResponse(html_path)
+
+
+async def handle_start_search(request: web.Request) -> web.Response:
+    """
+    API endpoint: receive location from the seeker Mini App.
+    Creates a seeker session and returns nearest garage.
+    """
+    # Verify Telegram auth
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    user_info = verify_telegram_init_data(init_data)
+    if not user_info:
+        return web.json_response({"success": False, "reason": "Unauthorized"}, status=401)
+
+    telegram_id = user_info["id"]
+    username = user_info.get("username", "")
+    first_name = user_info.get("first_name", "")
+
+    # Upsert user
+    try:
+        await upsert_user(telegram_id, username, first_name)
+    except Exception:
+        logger.exception("Failed to upsert user from seeker Mini App")
+
+    # Parse JSON body
+    try:
+        body = await request.json()
+        lat = float(body["latitude"])
+        lng = float(body["longitude"])
+    except Exception:
+        return web.json_response({"success": False, "reason": "Missing location"}, status=400)
+
+    # Create seeker session
+    try:
+        await create_seeker_session(telegram_id, lat, lng)
+    except Exception:
+        logger.exception("Failed to create seeker session from Mini App")
+        return web.json_response({"success": False, "reason": "Failed to start search"}, status=500)
+
+    # Find nearest garage as fallback
+    garage_data = None
+    try:
+        garage = await find_nearest_garage(lat, lng)
+        if garage:
+            garage_data = {
+                "name": garage["name"],
+                "price_per_hour": float(garage["price_per_hour"]),
+                "distance_meters": float(garage["distance_meters"]),
+            }
+    except Exception:
+        logger.debug("Garage lookup failed in seeker Mini App")
+
+    # Send confirmation message in chat
+    try:
+        text = MSG_SEEKER_SEARCHING
+        if garage_data:
+            text += MSG_SEEKER_GARAGE.format(
+                name=garage_data["name"],
+                price=garage_data["price_per_hour"],
+                distance=int(garage_data["distance_meters"]),
+            )
+        await http_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": telegram_id, "text": text},
+        )
+    except Exception:
+        pass
+
+    return web.json_response({
+        "success": True,
+        "garage": garage_data,
+    })
+
+
+def create_web_app() -> web.Application:
+    """Create the aiohttp web application."""
+    webapp = web.Application()
+    webapp.router.add_get("/hunter", handle_hunter_page)
+    webapp.router.add_get("/seeker", handle_seeker_page)
+    webapp.router.add_post("/api/submit-spot", handle_submit_spot)
+    webapp.router.add_post("/api/start-search", handle_start_search)
+    # Serve static files from webapp/ directory
+    if WEBAPP_DIR.exists():
+        webapp.router.add_static("/static/", WEBAPP_DIR)
+    return webapp
+
+
+# ---------------------------------------------------------------------------
+# Application setup
+# ---------------------------------------------------------------------------
+def main() -> None:
+    """Build and run the bot + web server."""
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Live location updates come as edited_message — handle via dedicated handler
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_location))
+
+    # Background jobs
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(matching_job, interval=MATCH_INTERVAL_SECONDS, first=MATCH_INTERVAL_SECONDS)
+        job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SECONDS, first=CLEANUP_INTERVAL_SECONDS)
+
+    if WEBAPP_URL:
+        # Run bot + web server together
+        logger.info("Starting bot (polling) + web server on port %s…", WEBAPP_PORT)
+
+        async def run_all():
+            # Start bot
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+
+            # Start web server
+            webapp = create_web_app()
+            runner = web.AppRunner(webapp)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", WEBAPP_PORT)
+            await site.start()
+            logger.info("Web server running on port %s", WEBAPP_PORT)
+
+            # Keep running until interrupted
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+                await runner.cleanup()
+
+        asyncio.run(run_all())
+    else:
+        # No WEBAPP_URL set — run bot only (original behavior)
+        logger.info("ParkingHunter bot starting (polling mode, no web server)…")
+        app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
